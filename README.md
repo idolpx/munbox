@@ -15,7 +15,7 @@ Preservation is achieved by prioritizing portability, avoiding lock-in to specif
 The following formats are supported as of today:
 
 * **BinHex 4.0** (.hqx)  
-* **StuffIt** (.sit \- various versions)  
+* **StuffIt** (.sit - various versions)  
 * **Compact Pro** (.cpt)  
 * **MacBinary** (.bin)  
 
