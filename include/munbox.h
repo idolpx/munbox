@@ -128,6 +128,24 @@ int munbox_error(const char *fmt, ...)
 
 munbox_layer_t *munbox_process_new(munbox_layer_t *initial_layer);
 
+/* --- Format Detection --- */
+
+/**
+ * @brief Test if a file can be decompressed by munbox without extracting.
+ * 
+ * This function probes the input to determine if munbox recognizes any supported
+ * formats. It returns the number of format layers detected in the processing
+ * pipeline (e.g., 1 for ".sit", 2 for ".sit.hqx", 3 for ".sit.bin.hqx").
+ * 
+ * The function does not perform full extraction and is safe to use for
+ * format validation without consuming significant resources.
+ * 
+ * @param initial_layer The input layer to probe (file or memory).
+ * @return Number of recognized format layers (>0 if supported, 0 if not, -1 on error).
+ *         The initial_layer is closed after probing regardless of the result.
+ */
+int munbox_probe(munbox_layer_t *initial_layer);
+
 /* --- Individual Format Handlers (for manual chaining if needed) --- */
 
 munbox_layer_t *munbox_new_mem_layer(const void *buffer, size_t size);

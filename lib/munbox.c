@@ -251,5 +251,59 @@ munbox_layer_t *munbox_process_new(munbox_layer_t * initial_layer) {
     }
 }
 
+// Test if munbox can decompress a file by detecting supported formats
+int munbox_probe(munbox_layer_t *initial_layer) {
+    if (!initial_layer) {
+        munbox_error("munbox_probe: NULL initial_layer");
+        return -1;
+    }
+
+    munbox_layer_t *current_layer = initial_layer;
+    int format_count = 0;
+
+    // Iterate through the format detection pipeline
+    // We let each factory try to recognize the format; if it succeeds,
+    // it returns a new layer wrapping the current one.
+    for (;;) {
+        if (format_count >= 16) {
+            // Safety limit: too many nested layers (probably a bug)
+            munbox_error("munbox_probe: exceeded maximum nesting depth");
+            // Close the entire chain starting from the top
+            if (current_layer && current_layer->close)
+                current_layer->close(current_layer);
+            return -1;
+        }
+
+        munbox_layer_t *next_layer = NULL;
+        int i;
+
+        // Try each format handler to see if it recognizes the current layer
+        for (i = 0; i < g_num_format_handlers; ++i) {
+            next_layer = g_format_handlers[i].layer_factory(current_layer);
+            if (next_layer) {
+                // Format recognized; move to the next layer in the chain
+                format_count++;
+                break;
+            }
+        }
+
+        // If we reached the end of the handler list, no more formats detected
+        if (i == g_num_format_handlers) {
+            break;
+        }
+
+        current_layer = next_layer;
+    }
+
+    // Close the entire layer chain
+    // Each layer's close() function is responsible for closing its source layer,
+    // so we only need to close the outermost layer
+    if (current_layer && current_layer->close)
+        current_layer->close(current_layer);
+
+    // Return the number of format layers detected (not including the initial file/mem layer)
+    return format_count;
+}
+
 // Processes a layer through the pipeline of format handlers and extracts files
 /* Deprecated old callback-based munbox_process() removed in favor of munbox_process_new(). */
