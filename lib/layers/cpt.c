@@ -216,7 +216,7 @@ static int cpt_new_node(cpt_pfx_t *pc) {
     void *nt = realloc(pc->tree, (size_t)(pc->n + 1) * sizeof(*pc->tree));
     if (!nt)
         return -1;
-    pc->tree = (typeof(pc->tree))nt;
+    pc->tree = nt;
     pc->tree[pc->n].b0 = -1;
     pc->tree[pc->n].b1 = -2;
     return pc->n++;
