@@ -31,3 +31,13 @@ jobs:
           # Allow the munbox executable to find shared libraries built in-tree
           export LD_LIBRARY_PATH="${{ github.workspace }}/build/lib:${LD_LIBRARY_PATH:-}"
           ./run_tests.sh --verbose --munbox ../build/cmd/munbox || true
+
+      - name: Sanitizer build and negative tests
+        run: |
+          # An AddressSanitizer build turns the memory-safety cases into hard failures, so a
+          # regression in the malformed-input handling is caught here as well as by CTest.
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DMUNBOX_ENABLE_ASAN=ON
+          cmake --build build-asan -- -j
+          chmod +x test/run_negative_tests.sh
+          ASAN_OPTIONS=detect_leaks=0 bash test/run_negative_tests.sh \
+            --munbox build-asan/cmd/munbox --test-dir test/testfiles

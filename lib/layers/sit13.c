@@ -23,6 +23,7 @@
 // Streaming-capable implementation of SIT method 13 (LZSS + Huffman).
 
 #include <assert.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,9 @@
 
 #define MAX_CODE      321
 #define INVALID_VALUE (MAX_CODE + 1)
+
+// Longest code word that fits the 32-bit canonical code used to build trees
+#define MAX_CODE_LENGTH 32
 
 /* Disable missing-braces warning for large generated initializer tables */
 #if defined(__GNUC__)
@@ -182,6 +186,8 @@ struct tree_node {
 // Allocate and initialize a new tree node
 struct tree_node *new_tree_node(void) {
     struct tree_node *p = malloc(sizeof(struct tree_node));
+    if (!p)
+        return NULL;
 
     p->child[0] = p->child[1] = NULL;
     p->value = INVALID_VALUE;
@@ -189,18 +195,29 @@ struct tree_node *new_tree_node(void) {
     return p;
 }
 
+// Free a tree and all of its nodes. Depth is bounded by MAX_CODE_LENGTH.
+static void free_tree(struct tree_node *tree) {
+    if (!tree)
+        return;
+
+    free_tree(tree->child[0]);
+    free_tree(tree->child[1]);
+    free(tree);
+}
+
 // Bit-level input buffer for reading variable-length codes from a byte buffer.
 struct input_buffer {
     const uint8_t *buf;
     size_t size;
     uint32_t bit_offset;
+    bool exhausted; // set when a read starts at or beyond the end of the buffer
 };
 
 // Read the next `i` bits from the input buffer and advance the bit offset.
 // This reads a 32-bit word at the current byte offset and returns the
 // requested bits (MSB within the selected window is the most significant
-// remaining bit). The caller must ensure there are enough bytes available
-// (or that the buffer is padded) for the 32-bit read.
+// remaining bit). Bytes beyond the end of the buffer read as zero; a read
+// that starts at or beyond the end also sets `exhausted`.
 static uint32_t next_bits(struct input_buffer *buf, int i) {
     if (i == 0)
         return 0;
@@ -210,8 +227,15 @@ static uint32_t next_bits(struct input_buffer *buf, int i) {
     uint32_t byte_offset = buf->bit_offset >> 3;
 
     // Read a 32-bit word so we can shift out an arbitrary number of bits
-    // without checking alignment on each call.
-    uint32_t word = *(uint32_t *)(buf->buf + byte_offset);
+    // without checking alignment on each call. Never load past the end of
+    // the buffer: the last bytes of a fork are followed by unrelated data
+    // or by the end of the archive allocation.
+    uint32_t word = 0;
+    size_t avail = byte_offset < buf->size ? buf->size - byte_offset : 0;
+    if (avail == 0)
+        buf->exhausted = true;
+    else
+        memcpy(&word, buf->buf + byte_offset, avail < sizeof(word) ? avail : sizeof(word));
 
     // Shift out already-consumed bits within the loaded word
     word >>= (buf->bit_offset & 7);
@@ -225,17 +249,23 @@ static uint32_t next_bits(struct input_buffer *buf, int i) {
 }
 
 // Walk the prefix tree using bits from `buf` until a leaf value is found.
+// Returns -1 if the bits do not form a code present in the tree.
 int tree_to_value(struct tree_node *tree, struct input_buffer *buf) {
-    while (tree->value == INVALID_VALUE)
+    while (tree->value == INVALID_VALUE) {
         tree = tree->child[next_bits(buf, 1)];
+
+        // Trees built from stream data may be incomplete
+        if (!tree)
+            return -1;
+    }
 
     return tree->value;
 }
 
 // Insert a code (bit sequence) of length `code_length` mapping to `value` into the tree.
-// 'code' is interpreted MSB-first across the specified length. Asserts if a
-// prefix collision is encountered.
-static void add_code(struct tree_node *tree, uint32_t code, int code_length, int value) {
+// 'code' is interpreted MSB-first across the specified length. Returns 0 on
+// success or -1 if a prefix collision is encountered or allocation fails.
+static int add_code(struct tree_node *tree, uint32_t code, int code_length, int value) {
     // Traverse the tree following bits from most significant to least.
     while (code_length--) {
 
@@ -244,32 +274,52 @@ static void add_code(struct tree_node *tree, uint32_t code, int code_length, int
 
         // If this node already holds a value, the new code would be a
         // descendant of an existing code (prefix collision).
-        assert(tree->value == INVALID_VALUE);
+        if (tree->value != INVALID_VALUE)
+            return -1;
 
-        if (!tree->child[next_bit])
+        if (!tree->child[next_bit]) {
             tree->child[next_bit] = new_tree_node();
+            if (!tree->child[next_bit])
+                return -1;
+        }
 
         tree = tree->child[next_bit];
     }
 
-    // Ensure a leaf node (no children) before storing the value.
-    assert(tree->child[0] == NULL && tree->child[1] == NULL);
+    // Ensure a leaf node (no children, no value yet) before storing the value.
+    if (tree->child[0] != NULL || tree->child[1] != NULL || tree->value != INVALID_VALUE)
+        return -1;
 
     tree->value = value;
+    return 0;
 }
 
 // Build a prefix tree from an array of code lengths per symbol. Uses a
 // canonical assignment: codes of the same length are assigned sequentially.
+// Returns NULL if the lengths do not describe a prefix-free code.
 static struct tree_node *tree_from_code_lengths(const int8_t *code_lengths, int n_codes) {
+    // The loop below only terminates once it has visited every symbol's
+    // length, counting up from -1, so lengths outside this range must be
+    // rejected up front.
+    for (int i = 0; i < n_codes; i++)
+        if (code_lengths[i] < -1 || code_lengths[i] > MAX_CODE_LENGTH)
+            return NULL;
+
     struct tree_node *tree = new_tree_node();
+    if (!tree)
+        return NULL;
 
     // 'symbol' holds the next canonical code for the current length.
-    for (int symbol = 0, completed_symbols = 0, length = -1; completed_symbols < n_codes; length++, symbol <<= 1)
+    uint32_t symbol = 0;
+    for (int completed_symbols = 0, length = -1; completed_symbols < n_codes; length++, symbol <<= 1)
 
         for (int i = 0; i < n_codes; i++)
             if (code_lengths[i] == length) {
-                if (length > 0)
-                    add_code(tree, (uint32_t)symbol, length, i); // assign canonical code -> symbol
+                // assign canonical code -> symbol
+                if (length > 0 && add_code(tree, symbol, length, i) < 0) {
+                    free_tree(tree);
+                    return NULL;
+                }
 
                 symbol++;
                 completed_symbols++;
@@ -280,12 +330,20 @@ static struct tree_node *tree_from_code_lengths(const int8_t *code_lengths, int 
 
 // Extract a tree by reading code-length metadata from the input using `metacode`.
 // The metacode emits commands that modify or repeat the current code length.
+// Returns NULL if the input is truncated or does not describe a valid tree.
 struct tree_node *extract_tree_with_metacode(struct tree_node *metacode, struct input_buffer *input, int n_codes) {
     int8_t lengths[n_codes];
 
-    for (int length = 0, i = 0; i < n_codes; lengths[i++] = (int8_t)length) {
+    // A repeat command names a store count; reject any that would run past the
+    // end of the table rather than silently dropping the extra entries. A valid
+    // stream stores exactly n_codes lengths, so this never fires for valid input.
+    for (int length = 0, i = 0; i < n_codes;) {
         int next_code = tree_to_value(metacode, input);
 
+        if (next_code < 0 || input->exhausted)
+            return NULL;
+
+        int repeats = 0; // extra stores this command makes before the trailing one
         if (next_code < 31)
             length = next_code + 1; // small values set new length = code+1
         else
@@ -301,22 +359,26 @@ struct tree_node *extract_tree_with_metacode(struct tree_node *metacode, struct 
                 break;
             case 34:
                 // optional repeat of the current length (1 bit flag)
-                if (next_bits(input, 1))
-                    lengths[i++] = (int8_t)length;
+                repeats = next_bits(input, 1) ? 1 : 0;
                 break;
             case 35:
                 // repeat current length several times (3-bit count + 2)
-                next_code = (int)next_bits(input, 3) + 2;
-                while (next_code--)
-                    lengths[i++] = (int8_t)length;
+                repeats = (int)next_bits(input, 3) + 2;
                 break;
             case 36:
                 // repeat current length many times (6-bit count + 10)
-                next_code = (int)next_bits(input, 6) + 10;
-                while (next_code--)
-                    lengths[i++] = (int8_t)length;
+                repeats = (int)next_bits(input, 6) + 10;
                 break;
             }
+
+        // The repeats plus the one trailing store must all fit the table
+        if (repeats > n_codes - i - 1)
+            return NULL;
+        while (repeats--)
+            lengths[i++] = (int8_t)length;
+
+        // Every command is followed by one store of the current length
+        lengths[i++] = (int8_t)length;
     }
 
     return tree_from_code_lengths(lengths, n_codes);
@@ -335,6 +397,15 @@ typedef struct {
     int pending_match_src; // source index for pending match
     bool initialized;
 } sit13_state_t;
+
+// Release the code trees owned by the state (the second may alias the first)
+static void sit13_free_trees(sit13_state_t *st) {
+    if (st->second_tree != st->first_tree)
+        free_tree(st->second_tree);
+    free_tree(st->first_tree);
+    free_tree(st->offset_tree);
+    st->first_tree = st->second_tree = st->offset_tree = st->current_tree = NULL;
+}
 
 // Shared setup code to build trees and initialize state
 static int sit13_setup(sit13_state_t *st) {
@@ -355,17 +426,33 @@ static int sit13_setup(sit13_state_t *st) {
                                                       0x6, 0x7, 0x7, 0x9, 0xC, 0xA, 0xB, 0xB, 0xC, 0xC, 0xB, 0xB, 0xB,
                                                       0xC, 0xC, 0xC, 0xC, 0xC, 0x5, 0x2, 0x2, 0x3, 0x4, 0x5};
         struct tree_node *meta_code = new_tree_node();
-        for (int i = 0; i < METACODE_SIZE; i++)
-            add_code(meta_code, meta_code_words[i], meta_code_lengths[i], i);
-        st->first_tree = extract_tree_with_metacode(meta_code, &st->input, MAX_CODE);
-        st->second_tree = (byte0 & 0x08) ? st->first_tree : extract_tree_with_metacode(meta_code, &st->input, MAX_CODE);
-        st->offset_tree = extract_tree_with_metacode(meta_code, &st->input, (byte0 & 0x07) + 10);
+        bool meta_ok = (meta_code != NULL);
+        for (int i = 0; meta_ok && i < METACODE_SIZE; i++)
+            meta_ok = (add_code(meta_code, meta_code_words[i], meta_code_lengths[i], i) == 0);
+
+        // Stop at the first tree that cannot be built; the check below reports it
+        if (meta_ok)
+            st->first_tree = extract_tree_with_metacode(meta_code, &st->input, MAX_CODE);
+        if (st->first_tree)
+            st->second_tree =
+                (byte0 & 0x08) ? st->first_tree : extract_tree_with_metacode(meta_code, &st->input, MAX_CODE);
+        if (st->second_tree)
+            st->offset_tree = extract_tree_with_metacode(meta_code, &st->input, (byte0 & 0x07) + 10);
+
+        // The metacode tree is only needed while reading the code lengths
+        free_tree(meta_code);
     } else if (code_set < 6) {
         const int offset_tree_length[5] = {11, 13, 14, 11, 11};
         st->first_tree = tree_from_code_lengths(first_tree_lengths[code_set - 1], MAX_CODE);
         st->second_tree = tree_from_code_lengths(second_tree_lengths[code_set - 1], MAX_CODE);
         st->offset_tree = tree_from_code_lengths(offset_tree_lengths[code_set - 1], offset_tree_length[code_set - 1]);
     } else {
+        return MUNBOX_ERROR;
+    }
+
+    // Code lengths taken from the stream may not describe usable trees
+    if (!st->first_tree || !st->second_tree || !st->offset_tree) {
+        sit13_free_trees(st);
         return MUNBOX_ERROR;
     }
     st->current_tree = st->first_tree;
@@ -397,6 +484,10 @@ static ssize_t sit13_produce(sit13_state_t *st, uint8_t *out, size_t out_cap) {
             next_value = st->current_tree->value;
         }
 
+        // Undecodable symbol, or the compressed data ended early
+        if (next_value < 0 || st->input.exhausted)
+            return MUNBOX_ERROR;
+
         if (next_value < 256) {
             uint8_t b = (uint8_t)next_value;
             out[produced++] = b;
@@ -418,6 +509,8 @@ static ssize_t sit13_produce(sit13_state_t *st, uint8_t *out, size_t out_cap) {
         }
         // Offset via offset_tree
         int ov = tree_to_value(st->offset_tree, &st->input);
+        if (ov < 0)
+            return MUNBOX_ERROR;
         int offset = (ov == 0) ? 1 : ((1 << (ov - 1)) + (int)next_bits(&st->input, ov - 1) + 1);
         int src_index = st->out_pos - offset;
 
@@ -438,6 +531,7 @@ size_t sit13(uint8_t *dst, size_t dst_len, const uint8_t *src, size_t src_len) {
     if (sit13_setup(&st) < 0)
         return 0;
     ssize_t n = sit13_produce(&st, dst, dst_len);
+    sit13_free_trees(&st);
     return (n < 0) ? 0 : (size_t)n;
 }
 
@@ -468,4 +562,9 @@ ssize_t sit13_read(sit13_ctx_t *ctx, uint8_t *out, size_t out_cap) {
     return sit13_produce(&ctx->st, out, out_cap);
 }
 
-void sit13_free(sit13_ctx_t *ctx) { free(ctx); }
+void sit13_free(sit13_ctx_t *ctx) {
+    if (!ctx)
+        return;
+    sit13_free_trees(&ctx->st);
+    free(ctx);
+}

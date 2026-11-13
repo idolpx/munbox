@@ -74,6 +74,9 @@ static void lzw_free(struct lzw_ctx *c);
 
 #define LOAD_BE16(p) (((uint16_t)((uint8_t *)(p))[0] << 8) | ((uint16_t)((uint8_t *)(p))[1]))
 
+// Size of the fixed part of a StuffIt 5 entry header (the name follows it)
+#define SIT5_HEADER1_MIN_LEN 48
+
 #define LOAD_BE32(p)                                                                                                   \
     (((uint32_t)((uint8_t *)(p))[0] << 24) | ((uint32_t)((uint8_t *)(p))[1] << 16) |                                   \
      ((uint32_t)((uint8_t *)(p))[2] << 8) | ((uint32_t)((uint8_t *)(p))[3]))
@@ -390,7 +393,8 @@ found:;
     state->format_state.classic.folder_depth = 0;
 
     layer->internal_state = state;
-    layer->read = NULL;
+    // Callers may probe with read() before a successful open(); it then reports an error
+    layer->read = sit_layer_read;
     layer->close = sit_layer_close;
     layer->open = sit_layer_open;
     return layer;
@@ -462,7 +466,8 @@ found:;
     state->is_sit5 = true;
 
     layer->internal_state = state;
-    layer->read = NULL;
+    // Callers may probe with read() before a successful open(); it then reports an error
+    layer->read = sit_layer_read;
     layer->close = sit_layer_close;
     layer->open = sit5_layer_open;
     return layer;
@@ -534,6 +539,10 @@ static int sit_read_next_entry(sit_layer_state_t *st) {
         if (name_len >= sizeof(filename)) {
             name_len = (uint8_t)(sizeof(filename) - 1);
         }
+        // The name may extend past the 112 header bytes checked above
+        if ((size_t)(header - data) + 3 + name_len > st->archive_size) {
+            return munbox_error("SIT: entry name out of range");
+        }
         memcpy(filename, header + 3, name_len);
         filename[name_len] = '\0';
 
@@ -583,13 +592,15 @@ static int sit_read_next_entry(sit_layer_state_t *st) {
         st->cur_info.finder_flags = LOAD_BE16(header + 74);
         st->cur_info.has_metadata = true;
 
-        uint8_t *comp_rsrc = header + 112;
-        uint8_t *comp_data = comp_rsrc + rsrc_comp_len;
-        
-        // Verify data doesn't exceed archive bounds
-        if ((size_t)(comp_data - data) + data_comp_len > st->archive_size) {
+        // Verify data doesn't exceed archive bounds. The sum is formed in 64 bits so
+        // that it cannot wrap where size_t is 32 bits wide.
+        uint64_t forks_end = (uint64_t)(header - data) + 112 + (uint64_t)rsrc_comp_len + (uint64_t)data_comp_len;
+        if (forks_end > (uint64_t)st->archive_size) {
             return -1; // Error: data fork out of range
         }
+
+        uint8_t *comp_rsrc = header + 112;
+        uint8_t *comp_data = comp_rsrc + rsrc_comp_len;
 
         // Fill fork descriptors
         st->rsrc_fork.uncomp_len = rsrc_len;
@@ -791,6 +802,8 @@ static ssize_t sit_stream_fill(sit_stream_state_t *ss, uint8_t *dst, size_t cap,
                 n = ss->out_rem;
             if (n > cap - produced)
                 n = cap - produced;
+            if (n == 0)
+                break; // input exhausted before the declared length was produced
             memcpy(dst + produced, ss->src + ss->src_pos, n);
             ss->src_pos += n;
             ss->out_rem -= n;
@@ -1045,6 +1058,7 @@ static int sit_layer_open(munbox_layer_t *self, munbox_open_t what, munbox_file_
 // Returns: 1 = file entry read, 0 = end of entries, -1 = error
 // Populates the current file info and fork descriptors in the state
 static int sit5_read_next_entry(sit_layer_state_t *st) {
+next_entry:
     if (st->format_state.sit5.entries_remaining == 0 || st->format_state.sit5.current_cursor == 0 || st->format_state.sit5.current_cursor >= st->archive_size) {
         return 0; // end of entries
     }
@@ -1062,6 +1076,9 @@ static int sit5_read_next_entry(sit_layer_state_t *st) {
         return munbox_error("SIT5: unsupported entry version");
     
     uint16_t header1_len = LOAD_BE16(header1 + 6);
+    // Fixed fields up to offset 47 are read below, and the CRC check clears bytes 32..33 of a copy
+    if (header1_len < SIT5_HEADER1_MIN_LEN)
+        return munbox_error("SIT5: header1 too short");
     if (offs + header1_len > st->archive_size)
         return munbox_error("SIT5: header1 length out of range");
     
@@ -1088,6 +1105,8 @@ static int sit5_read_next_entry(sit_layer_state_t *st) {
     // Extract name
     char namebuf[256];
     size_t cpylen = namelen < sizeof(namebuf) - 1 ? namelen : sizeof(namebuf) - 1;
+    if ((size_t)offs + SIT5_HEADER1_MIN_LEN + cpylen > st->archive_size)
+        return munbox_error("SIT5: entry name out of range");
     memcpy(namebuf, header1 + 48, cpylen);
     namebuf[cpylen] = '\0';
 
@@ -1128,7 +1147,7 @@ static int sit5_read_next_entry(sit_layer_state_t *st) {
             // Special folder marker - skip
             st->format_state.sit5.entries_remaining++;
             st->format_state.sit5.current_cursor = header_end;
-            return sit5_read_next_entry(st); // recursively try next entry
+            goto next_entry; // try next entry without recursing
         }
         
         // Regular folder - update directory stack
@@ -1162,13 +1181,13 @@ static int sit5_read_next_entry(sit_layer_state_t *st) {
         
         st->format_state.sit5.entries_remaining += numfiles;
         st->format_state.sit5.current_cursor = (uint32_t)(datastart_ptr - data);
-        return sit5_read_next_entry(st); // recursively try next entry
+        goto next_entry; // try next entry without recursing
     }
 
     // Handle special markers
     if (datalength == 0xffffffff) {
         st->format_state.sit5.current_cursor = header_end;
-        return sit5_read_next_entry(st); // recursively try next entry
+        goto next_entry; // try next entry without recursing
     }
 
     // Regular file entry
@@ -1194,11 +1213,14 @@ static int sit5_read_next_entry(sit_layer_state_t *st) {
     char full_filename[512];
     sit_join_path(full_filename, sizeof(full_filename), parent_path, namebuf);
 
-    // Verify fork data is within archive bounds
+    // Verify fork data is within archive bounds. The sum is formed in 64 bits so
+    // that it cannot wrap where size_t is 32 bits wide.
+    uint64_t forks_end = (uint64_t)(datastart_ptr - data) + (hasresource ? (uint64_t)resourcecomplen : 0) +
+                         (uint64_t)datacomplen;
+    if (forks_end > (uint64_t)st->archive_size)
+        return munbox_error("SIT5: data fork out of range");
     uint8_t *comp_rsrc = datastart_ptr;
     uint8_t *comp_data = datastart_ptr + (hasresource ? resourcecomplen : 0);
-    if ((size_t)(comp_data - data) + datacomplen > st->archive_size)
-        return munbox_error("SIT5: data fork out of range");
 
     // Populate state with current file info
     memset(&st->cur_info, 0, sizeof(st->cur_info));

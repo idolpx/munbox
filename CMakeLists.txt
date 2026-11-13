@@ -60,6 +60,17 @@ if(MUNBOX_BUILD_TESTS)
 				endif()
 			endif()
 		endforeach()
+		# Negative tests: malformed archives that must be handled without crashing or hanging.
+		# One aggregate case runs the whole suite under its own per-input timeout.
+		file(GLOB _MUNBOX_NEG_DIRS "${PROJECT_SOURCE_DIR}/test/testfiles/malformed_*")
+		if(_MUNBOX_NEG_DIRS)
+			add_test(NAME munbox_negative
+				COMMAND bash "${PROJECT_SOURCE_DIR}/test/run_negative_tests.sh"
+					--munbox $<TARGET_FILE:munbox_cli>
+					--test-dir "${PROJECT_SOURCE_DIR}/test/testfiles")
+			set_tests_properties(munbox_negative PROPERTIES TIMEOUT 180)
+		endif()
+
 		# Convenience aggregate target
 		add_custom_target(check COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure DEPENDS munbox_cli)
 	endif()
