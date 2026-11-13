@@ -241,11 +241,15 @@ static int cpt_pfx_build(cpt_pfx_t *pc, const int *lens, int count, int maxLen) 
                 int node = 0;
                 for (int bp = l - 1; bp >= 0; bp--) {
                     int bit = (code >> bp) & 1;
+                    // A leaf stores a symbol, not child indices: over-subscribed lengths
+                    // would otherwise descend through it
+                    if (cpt_is_leaf(pc, node))
+                        goto fail;
                     int next = bit ? pc->tree[node].b1 : pc->tree[node].b0;
                     if (next < 0) {
                         next = cpt_new_node(pc);
                         if (next < 0)
-                            return -1;
+                            goto fail;
                         if (bit)
                             pc->tree[node].b1 = next;
                         else
@@ -253,6 +257,9 @@ static int cpt_pfx_build(cpt_pfx_t *pc, const int *lens, int count, int maxLen) 
                     }
                     node = next;
                 }
+                // The code must end on a fresh node, not on a leaf or an internal node
+                if (pc->tree[node].b0 != -1 || pc->tree[node].b1 != -2)
+                    goto fail;
                 pc->tree[node].b0 = pc->tree[node].b1 = i;
                 if (l > pc->maxl)
                     pc->maxl = l;
@@ -268,11 +275,12 @@ built:;
     int tsizebits = (pc->maxl < pc->minl) ? 10 : (pc->maxl >= 10 ? 10 : pc->maxl);
     pc->tbits = tsizebits;
     unsigned tsizeu = 1u << (unsigned)tsizebits;
-    if (tsizeu > INT32_MAX) return -1;
+    if (tsizeu > INT32_MAX)
+        goto fail;
     int tsize = (int)tsizeu;
     pc->tab = malloc((size_t)tsize * sizeof(*pc->tab));
     if (!pc->tab)
-        return -1;
+        goto fail;
     for (int i = 0; i < tsize; i++) {
         int node = 0;
         int depth = 0;
@@ -299,6 +307,12 @@ built:;
         }
     }
     return 0;
+
+fail:
+    // Leave nothing half-built behind for the caller
+    free(pc->tree);
+    memset(pc, 0, sizeof(*pc));
+    return -1;
 }
 
 // Free the resources allocated by a prefix structure
@@ -492,8 +506,11 @@ static int cpt_lzhs_next(cpt_lzh_supplier_t *s, int *outbyte) {
             cpt_lzh_free_tables(&s->core);
         }
         if (!s->core.lit_built) {
-            if (cpt_lzh_build_tables(&s->core))
+            if (cpt_lzh_build_tables(&s->core)) {
+                // Do not keep a partial set of tables for a later call to use
+                cpt_lzh_free_tables(&s->core);
                 return 0;
+            }
         }
         if (cpt_br_bits_left(&s->core.br) == 0)
             return 0;
@@ -621,7 +638,8 @@ static ssize_t cpt_rle_stream_read(cpt_rle_stream_t *st, uint8_t *out, size_t ou
                     return (ssize_t)dp;
                 }
                 if (n != 0) {
-                    st->repeat = n - 2;
+                    // A count of 1 has no remaining repeats; n - 2 would go negative
+                    st->repeat = (n > 1) ? n - 2 : 0;
                     if (dp >= outlen) {
                         if (dp > (size_t)SSIZE_MAX) return -1;
                         return (ssize_t)dp;
@@ -1143,7 +1161,8 @@ munbox_layer_t *munbox_new_cpt_layer(munbox_layer_t *input) {
 
     // Initialize layer vtable
     layer->internal_state = st;
-    layer->read = NULL; // will be set on first open()
+    // Callers may probe with read() before a successful open(); it then reports an error
+    layer->read = cpt_layer_read;
     layer->close = cpt_layer_close;
     layer->open = cpt_layer_open;
     // no extract; use open/read

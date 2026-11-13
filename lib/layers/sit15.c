@@ -279,7 +279,7 @@ static int decode_arithmetic_bit_string(decompressor_state_t *state, arithmetic_
     int result = 0;
     for (int i = 0; i < num_bits; i++) {
         if (decode_arithmetic_symbol(state, model)) {
-            result |= 1 << i;
+            result |= (int)(1u << i); // unsigned shift: 1 << 31 is undefined for int
         }
     }
     return result;
